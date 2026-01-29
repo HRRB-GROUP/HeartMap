@@ -1,0 +1,268 @@
+# OpenEP
+# Copyright (c) 2021 OpenEP Collaborators
+#
+# This file is part of OpenEP.
+#
+# OpenEP is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenEP is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program (LICENSE.txt).  If not, see <http://www.gnu.org/licenses/>
+
+"""Module containing classes for storing surface data of a mesh."""
+
+from attr import attrs
+import numpy as np
+import warnings
+
+__all__ = []
+
+
+@attrs(auto_attribs=True, auto_detect=True)
+class Fields:
+    """
+    Class for storing information about the surface of a mesh
+
+    Args:
+        bipolar_voltage (np.ndarray): array of shape N_points
+        unipolar_voltage (np.ndarray): array of shape N_points
+        local_activation_time (np.ndarray): array of shape N_points
+        impedance (np.ndarray): array of shape N_points
+        force (np.ndarray): array of shape N_points
+        cell_region (np.ndarray): array of shape N_cells
+        longitudinal_fibres (np.ndarray): array of shape N_cells x 3
+        transverse_fibres (np.ndarray): array of shape N_cells x 3
+        pacing_site (np.ndarray): array of shape N_points
+    """
+
+    bipolar_voltage: np.ndarray = None
+    unipolar_voltage: np.ndarray = None
+    local_activation_time: np.ndarray = None
+    impedance: np.ndarray = None
+    force: np.ndarray = None
+    thickness: np.ndarray = None
+    cell_region: np.ndarray = None
+    longitudinal_fibres: np.ndarray = None
+    transverse_fibres: np.ndarray = None
+    pacing_site: np.ndarray = None
+    conduction_velocity: np.ndarray = None
+    cv_divergence: np.ndarray = None
+    histogram: np.ndarray = None
+    CUSTOM_FIELD_NAME = list()
+
+    def __attrs_post_init__(self):
+        self.CUSTOM_FIELD_NAME.clear()
+
+    def __repr__(self):
+        return f"fields: {tuple(self.__dict__.keys())}"
+
+    def __getitem__(self, field):
+        try:
+            return self.__dict__[field]
+        except KeyError as e:
+            raise ValueError(f"There is no field '{field}'.") from e
+
+    def __setitem__(self, field, value):
+        if field not in type(self).__annotations__ and field not in self.CUSTOM_FIELD_NAME:
+            self.CUSTOM_FIELD_NAME.append(field)
+
+        self.__dict__[field] = value
+
+    def __iter__(self):
+        return iter(self.__dict__.keys())
+
+    def __contains__(self, field):
+        return field in self.__dict__.keys()
+
+    def copy(self):
+        """Create a deep copy of Fields"""
+        fields = Fields()
+        for field in self:
+            if self[field] is None:
+                continue
+            fields[field] = np.array(self[field])
+
+        return fields
+
+    @classmethod
+    def from_pyvista(cls, mesh):
+        """Create a Fields object from a pyvista.PolyData mesh.
+
+        Args:
+            mesh (pyvista.PolyData): mesh from which Fields will be created.
+        """
+
+        fields = cls()
+        
+        #Load all fieldds from mesh
+        for point_data in mesh.point_data:
+            fields[point_data] = np.asarray(mesh.point_data[point_data])
+        for cell_data in mesh.cell_data:
+            fields[cell_data] = np.asarray(mesh.cell_data[cell_data])
+
+        return fields
+
+    @property
+    def custom(self):
+        return {key: self.__dict__[key] for key in self.CUSTOM_FIELD_NAME if key in self.__dict__}
+
+
+def extract_surface_data(surface_data):
+    """Extract surface data from a dictionary.
+
+    Args:
+        surface_data (dict): Dictionary containing numpy arrays that describe the
+            surface of a mesh as well as scalar values (fields)
+
+    Returns:
+        points (ndarray): 3D coordinates of points on the mesh
+        indices (ndarray): Indices of points that make up each face of the mesh
+        fields (Field): Field object that contains numpy arrays of the various
+            scalar fields
+    """
+
+    if surface_data['triRep']['X'].size == 0:
+        return None, None, Fields()
+
+    points = surface_data['triRep']['X'].astype(float)
+    indices = surface_data['triRep']['Triangulation'].astype(int)
+
+    if surface_data['act_bip'].size == 0:
+        local_activation_time = None
+        bipolar_voltage = None
+    else:
+        local_activation_time, bipolar_voltage = surface_data['act_bip'].T.astype(float)
+
+    if isinstance(local_activation_time, np.ndarray) and all(np.isnan(local_activation_time)):
+        local_activation_time = None
+    if isinstance(bipolar_voltage, np.ndarray) and all(np.isnan(bipolar_voltage)):
+        bipolar_voltage = None
+
+    if surface_data['uni_imp_frc'].size == 0:
+        unipolar_voltage = None
+        impedance = None
+        force = None
+    elif surface_data['uni_imp_frc'].size == 2:
+        unipolar_voltage, impedance = surface_data['uni_imp_frc'].T.astype(float)
+        force = None
+        warnings.warn("Force data was not detected in surface_data, force=None", UserWarning)
+    else:
+        unipolar_voltage, impedance, force = surface_data['uni_imp_frc'].T.astype(float)
+
+    if isinstance(force, np.ndarray) and all(np.isnan(unipolar_voltage)):
+        unipolar_voltage = None
+    if isinstance(force, np.ndarray) and all(np.isnan(impedance)):
+        impedance = None
+    if isinstance(force, np.ndarray) and all(np.isnan(force)):
+        force = None
+
+    thickness = surface_data.get('thickness', None)
+    if isinstance(thickness, np.ndarray):
+        thickness = None if thickness.size == 0 else thickness.astype(float)
+
+    # This is defined on a per-cell bases
+    cell_region = surface_data.get('cell_region', None)
+    if isinstance(cell_region, np.ndarray):
+        cell_region = None if cell_region.size == 0 else cell_region.astype(int)
+
+    # Fibre orientation are vectors defined on a per-cell basis
+    try:
+        longitudinal_fibres = surface_data['fibres']['longitudinal'].astype(float)
+    except:
+        longitudinal_fibres = None
+
+    if isinstance(longitudinal_fibres, np.ndarray) and longitudinal_fibres.size == 0:
+        longitudinal_fibres = None
+
+    try:
+        transverse_fibres = surface_data['fibres']['transverse'].astype(float)
+    except:
+        transverse_fibres = None
+
+    if isinstance(transverse_fibres, np.ndarray) and transverse_fibres.size == 0:
+        transverse_fibres = None
+
+    # Pacing site point ids (-1 is not pacing site)
+    pacing_site = surface_data.get('pacing_site', None)
+    if isinstance(pacing_site, np.ndarray):
+        pacing_site = None if pacing_site.size == 0 else pacing_site.astype(int)
+
+    # custom fields
+    signal_maps = surface_data.get('signalMaps')
+    extracted_surfaces = {}
+    if signal_maps:
+        for surface_name, surface_dict in signal_maps.items():
+
+            if not isinstance(surface_dict, dict):
+                continue
+
+            surface_props = surface_dict.get('propSettings', None)
+
+            if surface_props.get('type') != 'field':
+                continue
+
+            surface_values = surface_dict.get('value', None)
+            if isinstance(surface_values, np.ndarray):
+                surface_values = None if surface_values.size == 0 else surface_values.astype(float)
+
+            extracted_surfaces[surface_name] = surface_values
+
+    fields = Fields(
+        bipolar_voltage=bipolar_voltage,
+        unipolar_voltage=unipolar_voltage,
+        local_activation_time=local_activation_time,
+        impedance=impedance,
+        force=force,
+        thickness=thickness,
+        cell_region=cell_region,
+        longitudinal_fibres=longitudinal_fibres,
+        transverse_fibres=transverse_fibres,
+        pacing_site=pacing_site,
+    )
+
+    for custom_field_name, custom_field in extracted_surfaces.items():
+        fields[custom_field_name] = custom_field
+
+    return points, indices, fields
+
+
+def empty_fields(n_points=0, n_cells=0):
+    """Create an empty Fields object with empty numpy arrays.
+
+    Returns:
+        fields (Field): Field object that contains numpy arrays of the various
+            scalar fields
+    """
+
+    local_activation_time = np.full(n_points, fill_value=np.nan, dtype=float)
+    bipolar_voltage = np.full(n_points, fill_value=np.nan, dtype=float)
+    unipolar_voltage = np.full(n_points, fill_value=np.nan, dtype=float)
+    impedance = np.full(n_points, fill_value=np.nan, dtype=float)
+    force = np.full(n_points, fill_value=np.nan, dtype=float)
+    thickness = np.full(n_points, fill_value=np.nan, dtype=float)
+    cell_region = np.full(n_cells, fill_value=0, dtype=int)
+    longitudinal_fibres = np.full((n_cells, 3), fill_value=np.nan)
+    transverse_fibres = np.full((n_cells, 3), fill_value=np.nan)
+    pacing_site = np.full(n_points, fill_value=-1, dtype=int)
+
+    fields = Fields(
+        bipolar_voltage,
+        unipolar_voltage,
+        local_activation_time,
+        impedance,
+        force,
+        thickness,
+        cell_region,
+        longitudinal_fibres,
+        transverse_fibres,
+        pacing_site,
+    )
+
+    return fields

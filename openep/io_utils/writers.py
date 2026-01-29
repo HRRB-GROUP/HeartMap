@@ -1,0 +1,673 @@
+# OpenEP
+# Copyright (c) 2021 OpenEP Collaborators
+#
+# This file is part of OpenEP.
+#
+# OpenEP is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenEP is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program (LICENSE.txt).  If not, see <http://www.gnu.org/licenses/>
+
+"""
+Saving datasets --- :mod:`openep.io.writers`
+============================================
+
+This module contains functions to export OpenEP data sets.
+
+Example of saving a dataset
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Mesh data can be exported to openCARP format as follows:
+
+.. code:: python
+
+    import openep
+    from openep._datasets.openep_datasets import DATASET_2
+
+    case = openep.load_openep_mat(DATASET_2)
+    openep.export_openCARP(
+        case=case,
+        prefix="dataset_2",
+    )
+
+This will save the mesh data from the case dataset into openCARP files, i.e.
+the points data will be stored in `dataset_2.pts`, the vertex data will be
+stored in `dataset_2.elem`, and fibre orientation will be stored in `dataset_2.lon`.
+
+Warning
+-------
+If a case has no fibre orientations (in `case.fields.longitudinal_fibres` and
+`case.fields.transverse_fibres`), then isotropic firbres will be used.
+
+.. autofunction:: export_openCARP
+
+"""
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import scipy.io
+import pathlib
+
+from openep.data_structures.ablation import Ablation
+from openep.data_structures.case import Case
+from openep.data_structures.surface import Fields
+from openep.data_structures.electric import Electric
+from openep.data_structures.vectors import Vectors
+
+__all__ = [
+    "export_openCARP",
+    "export_openep_mat",
+    "export_vtk",
+    "export_vtx",
+    "export_csv"
+]
+
+
+def export_openCARP(
+    case: Case,
+    prefix: str,
+    scale_points: float = 1,
+    export_transverse_fibres: bool = True,
+    export_pacing_site: bool = True,
+):
+    """Export mesh data from an OpenEP data to openCARP format.
+
+    The following data are written to file:
+        - `case.points` is used to write f'{prefix}'.pts
+        - `case.indices` is used to write f'{prefix}'.elem
+        - `case.fields.cell_region` is used to define the regions in f'{prefix}'.elem
+        - `case.fields.longitudinal_fibres` and `case.fields.transverse_fibres` are
+          used to write f'{prefix}'.lon
+        - `case.fields.pacing_site` is used to write f'{pacing_site}'.vtx
+
+    Args:
+        case (Case): dataset to be exported
+        prefix (str): filename prefix for writing mesh data to files
+        scale_points (float, optional): Scale the point positions by this number. Useful to scaling
+            the units to be in micrometre rather than mm (by setting scale_points=1e-3).
+        export_transverse_fibres (bool, optional). If True, both longitudinal and transverse
+            fibres directions will be written to the .lon file. If False, only longitudinal fibre
+            directions will be written.
+    """
+
+    output_path = pathlib.Path(prefix).resolve()
+
+    # Save points info
+    np.savetxt(
+        output_path.with_suffix(".pts"),
+        case.points * scale_points,
+        fmt="%.6f",
+        header=str(case.points.size//3),
+        comments='',
+    )
+
+    # Total number of lines
+    n_triangles = case.indices.shape[0]
+    n_lin_conns = 0 if case.vectors.linear_connections is None else case.vectors.linear_connections.shape[0]
+    n_lines = n_triangles + n_lin_conns
+
+    # Save triangulation elements info
+    cell_type = np.full(n_triangles, fill_value="Tr")
+    cell_region = case.fields.cell_region if case.fields.cell_region is not None else np.zeros(n_triangles, dtype=int)
+
+    combined_cell_data = [cell_type[:, np.newaxis], case.indices, cell_region[:, np.newaxis]]
+    combined_cell_data = np.concatenate(combined_cell_data, axis=1, dtype=object)
+
+    np.savetxt(
+        output_path.with_suffix(".elem"),
+        combined_cell_data,
+        fmt="%s %d %d %d %d",
+        header=str(n_lines),
+        comments='',
+    )
+
+    # Save linear connections info
+    if case.vectors.linear_connections is not None:
+        conn_type = np.full(n_lin_conns, fill_value="Ln")
+        ln_region = case.vectors.linear_connection_regions if case.vectors.linear_connection_regions is not None else np.zeros(n_lin_conns, dtype=int)
+
+        combined_ln_conn_data = [conn_type[:, np.newaxis], case.vectors.linear_connections, ln_region[:, np.newaxis]]
+        combined_ln_conn_data = np.concatenate(combined_ln_conn_data, axis=1, dtype=object)
+
+        # append to the elem file
+        with open(output_path.with_suffix(".elem"), 'a') as elem_file:
+            np.savetxt(
+                elem_file,
+                combined_ln_conn_data,
+                fmt="%s %d %d %d",
+            )
+
+    # Save fibres
+    if case.vectors.fibres is None:
+        _fibres = np.tile([1, 0, 0], (n_lines, 1))
+    else:
+        _dummy_vals_for_lin_connections = np.tile([1, 0, 0], (n_lin_conns, 1))
+        _fibres = np.vstack([case.vectors.fibres,_dummy_vals_for_lin_connections])
+
+    assert _fibres.shape[0] == n_lines, "Number of .elem lines do not match .lon lines"
+
+    with open(output_path.with_suffix('.lon'), 'w') as f:
+        f.write("1\n")
+        np.savetxt(
+            f,
+            _fibres,
+            fmt="%.6f",
+            comments='',
+        )
+
+    # Saving pacing sites if they exist
+    if case.fields.pacing_site is None or not export_pacing_site:
+        return
+
+    # Ignore all -1 values, as these points do not belong to any pacing site
+    for site_index in np.unique(case.fields.pacing_site)[1:]:
+
+        pacing_site_points = np.nonzero(case.fields.pacing_site == site_index)[0]
+        n_points = pacing_site_points.size
+
+        np.savetxt(
+            output_path.with_name(f'{output_path.name}_pacing_site_{site_index}.vtx'),
+            pacing_site_points,
+            header=f'{n_points}\nintra',
+            comments='',
+            fmt='%d',
+        )
+
+
+def export_vtx(
+    case: Case,
+    prefix: str,
+    pacing_site_internal_name: str
+):
+    """
+    Export vertex indices for a specified pacing site to a .vtx file.
+
+    Args:
+    - case (Case): The case object containing the pacing site and landmark information.
+    - prefix (str): The file path prefix for saving the output .vtx file.
+    - pacing_site_internal_name (str): The tag of the pacing site to export.
+
+    Returns:
+    - pathlib.Path: The path to the created .vtx file, or None if the pacing site is not found.
+
+    Raises:
+    - IndexError: If the specified pacing site name is not found within the case landmarks.
+    """
+    # TODO: Need to improve indexing method to find pacing site from landmarks,
+    #  currently finds pacing sites using tag string.
+
+    output_path = pathlib.Path(prefix).resolve()
+
+    if case.fields.pacing_site is None:
+        return
+
+    # This extracts the pacing sites from all landmarks by checking if the tag is of the form "Pacing site 1"
+    landmarks = case.electric.landmark_points
+    try:
+        landmark_index = np.where(landmarks.internal_names == pacing_site_internal_name)[0][0]
+    except IndexError:
+        raise IndexError(f"Pacing site: Expecting {landmarks.internal_names}, received \"{pacing_site_internal_name}\".")
+
+    landmark_name = landmarks.names[landmark_index]
+    site_index = int(float(landmark_name.replace('Pacing site ', '')))
+
+    pacing_site_points = np.nonzero(case.fields.pacing_site == site_index)[0]
+    n_points = pacing_site_points.size
+
+    output_path_with_suffix = output_path.with_name(f'{output_path.name}_{pacing_site_internal_name}.vtx')
+
+    np.savetxt(
+        output_path_with_suffix,
+        pacing_site_points,
+        header=f'{n_points}\nintra',
+        comments='',
+        fmt='%d',
+    )
+    return output_path_with_suffix
+
+
+def export_openep_mat(
+    case: Case,
+    filename: str,
+):
+    """Export data in OpenEP format.
+
+    Args:
+        case (Case): dataset to be exported
+        filename (str): name of file to be written
+    """
+
+    userdata = {}
+    userdata['notes'] = case.notes.astype(object) if case.notes is not None else np.array([], dtype=object)
+
+    userdata['surface'] = _extract_surface_data(
+        points=case.points,
+        indices=case.indices,
+        fields=case.fields,
+    )
+    userdata['surface'] = _add_custom_surface_maps(
+        surface_data=userdata['surface'],
+        fields=case.fields,
+    )
+
+    userdata['surface'] = _add_vector_data(
+        surface_data=userdata['surface'],
+        vectors=case.vectors
+    )
+
+    userdata['electric'] = _extract_electric_data(electric=case.electric)
+
+    if case.analyse.conduction_velocity.values is not None:
+        userdata['electric'] = _add_electric_signal_props(
+            electric_data=userdata['electric'],
+            conduction_velocity=case.analyse.conduction_velocity,
+            divergence=case.analyse.divergence
+        )
+
+    if case.ablation is not None:
+        userdata['rf'] = _export_ablation_data(ablation=case.ablation)
+
+    scipy.io.savemat(
+        file_name=filename,
+        mdict={'userdata': userdata},
+        format="5",
+        do_compression=True,
+        oned_as='column',
+    )
+
+
+def _add_custom_surface_maps(surface_data, fields):
+    """Dynamically write all custom fields to openep file"""
+    subset_fields = fields.custom.copy()
+    subset_fields['conduction_velocity'] = fields.conduction_velocity
+    subset_fields['cv_divergence'] = fields.cv_divergence
+
+    if not surface_data.get('signalMaps'):
+        surface_data['signalMaps'] = {}
+
+    # TODO: connect propSetting from user setting in UI
+    for name, field in subset_fields.items():
+        if field is not None:
+            surface_data['signalMaps'][name] = {
+                'name': name,
+                'value': field,
+                'propSettings': {
+                    'type': 'field'
+                },
+            }
+    return surface_data
+
+
+def export_csv(
+        system,
+        filename: str,
+        selections: dict,
+        cell_data_selections: dict=None,
+):
+
+    """Export data in CSV format.
+
+    Saves selected field data.
+
+    Args:
+        system (model.system_manager.System): System with dataset to be exported
+        filename (str): name of file to be written
+        selections (dict): the data field name and flag whether to export or not
+    """
+    case = system.case
+    mesh = system.mesh
+
+    point_region = _convert_cell_to_point(
+        cell_data=case.fields.cell_region,
+        mesh=mesh
+    )
+
+    available_exports = {
+        'Bipolar voltage': case.fields.bipolar_voltage,
+        'Unipolar voltage': case.fields.unipolar_voltage,
+        'LAT': case.fields.local_activation_time,
+        'Force': case.fields.force,
+        'Impedance': case.fields.impedance,
+        'Thickness': case.fields.thickness,
+        'Cell region': point_region,
+        'Pacing site': case.fields.pacing_site,
+        'Conduction velocity': case.fields.conduction_velocity,
+        'Divergence': case.fields.cv_divergence,
+        'Histogram': case.fields.histogram,
+    }
+
+    _dictionary2csv(
+        available_exports=available_exports,
+        selections=selections,
+        filename=Path(filename).with_stem(Path(filename).stem + '_points').with_suffix('.csv')
+    )
+
+    if cell_data_selections is not None:
+        temp_mesh = mesh.compute_cell_sizes()
+        available_cell_exports = {
+            'Cell region': case.fields.cell_region,
+            'Cell area': temp_mesh.cell_data['Area']
+        }
+        _dictionary2csv(
+            available_exports=available_cell_exports,
+            selections=cell_data_selections,
+            filename=Path(filename).with_stem(Path(filename).stem + '_cells').with_suffix('.csv')
+        )
+
+def _dictionary2csv(
+        available_exports,
+        selections,
+        filename,
+):
+    """Converts diectionary and selection to a CSV file"""
+    df = pd.DataFrame()
+    for field_name, checked in selections.items():
+        header = field_name.lower().replace(" ", "_")
+        if checked:
+            field_data = available_exports.get(field_name)
+            if field_data is not None:
+                df[header] = pd.Series(field_data)
+            else:
+                df[header] = pd.NA
+
+    df.to_csv(filename, index=False, encoding='utf-8')
+
+
+def _add_electric_signal_props(electric_data, **kwargs):
+    conduction_velocity = kwargs.get('conduction_velocity')
+    divergence = kwargs.get('divergence')
+
+    if not electric_data.get('annotations'):
+        electric_data['annotations'] = {}
+
+    if not electric_data['annotations'].get('signalProps'):
+        electric_data['annotations']['signalProps'] = {}
+
+    signal_props = electric_data['annotations']['signalProps']
+
+    if conduction_velocity:
+        signal_props['conduction_velocity'] = {
+            'name' : 'Conduction Velocity Values',
+            'value': conduction_velocity.values,
+        }
+        signal_props['cvX'] = {
+            'name' : 'Conduction Velocity Coordinates',
+            'value': conduction_velocity.centers,
+        }
+
+    if divergence:
+        signal_props['divergence'] = {
+            'name' : 'Divergence Values',
+            'value': divergence.values,
+        }
+
+    return electric_data
+
+
+def export_vtk(
+    case: Case,
+    filename: str,
+):
+    """Export data in vtk format.
+
+    Saves all field data.
+
+    Args:
+        case (Case): dataset to be exported
+        filename (str): name of file to be written
+    """
+
+    mesh = case.create_mesh()
+    for field in case.fields:
+        if case.fields[field] is None:
+            continue
+        if len(case.fields[field]) == mesh.n_points:
+            mesh.point_data[field] = case.fields[field]
+        elif len(case.fields[field]) == mesh.n_cells:
+            mesh.cell_data[field] = case.fields[field]
+
+    mesh.save(filename)
+
+
+def _extract_surface_data(
+    points : np.ndarray,
+    indices: np.ndarray,
+    fields: Fields,
+):
+    """Create a dictionary of surface data.
+
+    Args:
+        points (np.ndarray): 3D coordinates of points on the mesh
+        indices (np.ndarray): Indices of points that make up each face of the mesh
+        fields (Fields): bipolar voltage, unipolar voltage, local activation time,
+            impedance, and force at each point on the mesh.
+
+    Returns:            
+        surface_data (dict): Dictionary containing numpy arrays that describe the
+            surface of a mesh as well as scalar values (fields)
+    """
+
+    # Make sure none of the attributes are equal to None - scipy can't handle this
+    empty_float_array = np.array([], dtype=float)
+    empty_int_array = np.array([], dtype=int)
+
+    surface_data = {}
+
+    surface_data['triRep'] = {}
+    surface_data['triRep']['X'] = points if points is not None else empty_float_array
+
+    # TriRep requires doubles not ints, and MATLAB uses 1-based indexing
+    triangulation = indices.astype(float) + 1 if indices is not None else empty_int_array
+    surface_data['triRep']['Triangulation'] = triangulation
+
+    if fields.local_activation_time is None and fields.bipolar_voltage is None:
+        surface_data['act_bip'] = empty_float_array
+    elif fields.local_activation_time is None:
+        fields.local_activation_time = np.full_like(fields.bipolar_voltage, fill_value=np.nan)
+    elif fields.bipolar_voltage is None:
+        fields.bipolar_voltage = np.full_like(fields.local_activation_time, fill_value=np.nan)
+
+    if 'act_bip' not in surface_data:
+        surface_data['act_bip'] = np.concatenate(
+            [
+                fields.local_activation_time[:, np.newaxis],
+                fields.bipolar_voltage[:, np.newaxis],
+            ],
+            axis=1,
+        )
+
+    if fields.unipolar_voltage is None and fields.impedance is None and fields.force is None:
+        surface_data['uni_imp_frc'] = empty_float_array
+    else:
+        if fields.unipolar_voltage is None:
+            fields.unipolar_voltage = np.full(points.size // 3, fill_value=np.nan)
+        if fields.impedance is None:
+            fields.impedance = np.full(points.size // 3, fill_value=np.nan)
+        if fields.force is None:
+            fields.force = np.full(points.size // 3, fill_value=np.nan)
+
+    if 'uni_imp_frc' not in surface_data:
+        surface_data['uni_imp_frc'] = np.concatenate(
+            [
+                fields.unipolar_voltage[:, np.newaxis],
+                fields.impedance[:, np.newaxis],
+                fields.force[:, np.newaxis],
+            ],
+            axis=1,
+        )
+
+    surface_data['thickness'] = fields.thickness if fields.thickness is not None else empty_float_array
+    surface_data['cell_region'] = fields.cell_region if fields.cell_region is not None else empty_int_array
+    surface_data['longitudinal'] = fields.longitudinal_fibres if fields.longitudinal_fibres is not None else empty_float_array
+    surface_data['transverse'] = fields.transverse_fibres if fields.transverse_fibres is not None else empty_float_array
+    surface_data['pacing_site'] = fields.pacing_site if fields.pacing_site is not None else empty_int_array
+
+    # Remove arrays that are full of NaNs
+    for field_name, field in surface_data.items():
+        if isinstance(field, dict):
+            continue
+        if np.all(np.isnan(field)):
+            surface_data[field_name] = empty_float_array
+
+    return surface_data
+
+
+def _extract_electric_data(electric: Electric):
+    """Create a dictionary of electric data.
+
+    Args:
+        electric (Electric): object containing electric data associated with electrograms
+            taken at various mapping points.
+
+    Returns:
+        electric_data (dict): Dictionary containing numpy arrays that describe the
+            electric data associated with electrograms taken at various mapping points.
+    """
+
+    # Make sure none of the attributes are equal to None - scipy can't handle this
+    empty_object_array = np.array([], dtype=object)  # for empty string arrays
+    empty_float_array = np.array([], dtype=float)
+    empty_int_array = np.array([], dtype=int)
+
+    electric_data = {}
+    electric_data['tags'] = electric._names.astype(object) if electric._names is not None else empty_object_array
+    electric_data['names'] = electric._internal_names.astype(object) if electric._internal_names is not None else empty_object_array
+    electric_data['include'] = electric._include if electric._include is not None else empty_int_array
+
+    electric_data['sampleFrequency'] = float(electric.frequency)
+
+    electric_data['electrodeNames_bip'] = electric.bipolar_egm._names.astype(object) if electric.bipolar_egm._names is not None else empty_object_array
+    electric_data['egmX'] = electric.bipolar_egm._points if electric.bipolar_egm._points is not None else empty_float_array
+    electric_data['egm'] = electric.bipolar_egm._egm if electric.bipolar_egm._egm is not None else empty_float_array
+    electric_data['egmGain'] = electric.bipolar_egm._gain if electric.bipolar_egm._gain is not None else empty_float_array
+
+    electric_data['electrodeNames_uni'] = electric.unipolar_egm._names.astype(object) if electric.unipolar_egm._names is not None else empty_object_array
+    electric_data['egmUniX'] = electric.unipolar_egm._points if electric.unipolar_egm._points is not None else empty_float_array
+    electric_data['egmUni'] = electric.unipolar_egm._egm if electric.unipolar_egm._egm is not None else empty_float_array
+    electric_data['egmUniGain'] = electric.unipolar_egm._gain if electric.unipolar_egm._gain is not None else empty_float_array
+
+    electric_data['egmRef'] = electric.reference_egm._egm if electric.reference_egm._egm is not None else empty_float_array
+    electric_data['egmRefGain'] = electric.reference_egm._gain if electric.reference_egm._gain is not None else empty_float_array
+
+    electric_data['ecg'] = electric.ecg._ecg if electric.ecg._ecg is not None else empty_float_array
+    electric_data['ecgGain'] = electric.ecg._gain if electric.ecg._gain is not None else empty_float_array
+    electric_data['ecgNames'] = electric.ecg.channel_names.astype(object) if electric.ecg.channel_names is not None else empty_object_array
+
+    electric_data['egmSurfX'] = electric.surface._nearest_point if electric.surface._nearest_point is not None else empty_float_array
+    electric_data['barDirection'] = electric.surface._normals if electric.surface._normals is not None else empty_float_array
+
+    annotations = electric.annotations
+    electric_data['annotations'] = {}
+    electric_data['annotations']['woi'] = annotations._window_of_interest_indices if annotations._window_of_interest_indices is not None else empty_int_array
+    electric_data['annotations']['referenceAnnot'] = annotations._reference_activation_time_indices if annotations._reference_activation_time_indices is not None else empty_int_array
+    electric_data['annotations']['mapAnnot'] = annotations._local_activation_time_indices if annotations._local_activation_time_indices is not None else empty_int_array
+
+    electric_data['voltages'] = {}
+    electric_data['voltages']['bipolar'] = electric.bipolar_egm._voltage if electric.bipolar_egm._voltage is not None else empty_float_array
+    electric_data['voltages']['unipolar'] = electric.unipolar_egm._voltage if electric.unipolar_egm._voltage is not None else empty_float_array
+
+    # Voltages are added when loading a dataset if egms are present
+    # These should be removed before saving
+    for channel, voltage in electric_data['voltages'].items():
+        if all(np.isnan(voltage)):
+            electric_data['voltages'][channel] = empty_float_array
+
+    electric_data['impedances'] = {}
+    electric_data['impedances']['time'] = electric.impedance.times if electric.impedance.times is not None else empty_float_array
+    electric_data['impedances']['value'] = electric.impedance.values if electric.impedance.values is not None else empty_float_array
+
+    return electric_data
+
+
+def _export_ablation_data(ablation: Ablation):
+    """Create a dictionary of ablation data.
+
+    Args:
+        ablation (Ablation): times, power, impedance and temperature for each ablation site,
+            as well as the force applied.
+
+    Returns:
+        ablation_data (dict): Dictionary containing numpy arrays that describe the
+            ablation sites.
+    """
+
+    # Make sure none of the attributes are equal to None - scipy can't handle this
+    empty_float_array = np.array([], dtype=float)
+
+    ablation_data = {}
+    ablation_data['originaldata'] = {}
+
+    ablation_data['originaldata']['ablparams'] = {}
+    ablation_data['originaldata']['ablparams']['time'] = ablation.times if ablation.times is not None else empty_float_array
+    ablation_data['originaldata']['ablparams']['power'] = ablation.power if ablation.power is not None else empty_float_array
+    ablation_data['originaldata']['ablparams']['impedance'] = ablation.impedance if ablation.impedance is not None else empty_float_array
+    ablation_data['originaldata']['ablparams']['distaltemp'] = ablation.temperature if ablation.temperature is not None else empty_float_array
+
+    ablation_data['originaldata']['force'] = {}
+    ablation_data['originaldata']['force']['time'] = ablation.force.times if ablation.force.times is not None else empty_float_array
+    ablation_data['originaldata']['force']['force'] = ablation.force.force if ablation.force.force is not None else empty_float_array
+    ablation_data['originaldata']['force']['axialangle'] = ablation.force.axial_angle if ablation.force.axial_angle is not None else empty_float_array
+    ablation_data['originaldata']['force']['lateralangle'] = ablation.force.lateral_angle if ablation.force.lateral_angle is not None else empty_float_array
+    ablation_data['originaldata']['force']['position'] = ablation.force.points if ablation.force.points is not None else empty_float_array
+
+    return ablation_data
+
+
+def _add_vector_data(
+        surface_data,
+        vectors: Vectors,
+):
+    """Add vector data: fibres, linear connections, linear_connections_regions"""
+    if vectors is None:
+        return surface_data
+
+    if not surface_data.get('signalMaps'):
+        surface_data['signalMaps'] = {}
+
+    if vectors.fibres is not None:
+        surface_data['signalMaps']['fibres'] = {
+            'name': 'fibres',
+            'value': vectors.fibres,
+            'propSettings': {
+                'type': 'vectors'
+            },
+        }
+
+    if vectors.linear_connections is not None:
+        surface_data['signalMaps']['linear_connections'] = {
+            'name': 'linear_connections',
+            'value': vectors.linear_connections,
+            'propSettings': {},
+        }
+
+    if vectors.linear_connection_regions is not None:
+        surface_data['signalMaps']['linear_connection_regions'] = {
+            'name': 'linear_connection_regions',
+            'value': vectors.linear_connection_regions,
+            'propSettings': {},
+        }
+
+    return surface_data
+
+
+def _convert_cell_to_point(cell_data, mesh):
+    """Convert cell data to point data by applying the cell value to its vertices"""
+    point_data = np.zeros(mesh.n_points, dtype=int)
+    for cell_i in range(mesh.n_cells):
+
+        cell_value = cell_data[cell_i]
+        point_ids = mesh.get_cell(cell_i).point_ids
+
+        # Add cell value to point ids
+        for pid in point_ids:
+            point_data[pid] = cell_value
+
+    return point_data
