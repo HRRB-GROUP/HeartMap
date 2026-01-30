@@ -4,9 +4,6 @@ from openep.io_utils import readers, writers
 from openep._datasets.openep_datasets import DATASET_2, DATASET_1, DATASET_registered
 
 import pyvista as pv
-from openep.mesh_tools.newregistration import CPDRegistrationWorker
-
-import pyvista as pv
 
 
 def case_to_pyvista_mesh(case):
