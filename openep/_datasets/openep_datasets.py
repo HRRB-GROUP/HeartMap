@@ -8,7 +8,7 @@ the triRep object cast to a regular struct, then saved as a version 7.0 MAT file
 
 """
 __all__ = [
-    "DATASET_2","DATASET_1"
+    "DATASET_2","DATASET_1","DATASET_registered"
 ]
 
 from pkg_resources import resource_filename
@@ -17,3 +17,5 @@ DATASET_1 = resource_filename(__name__,
                                   "OpenEP-MATLAB/openep_dataset_1.mat")
 DATASET_2 = resource_filename(__name__,
                                   "OpenEP-MATLAB/openep_dataset_2.mat")
+DATASET_registered = resource_filename(__name__,
+                                  "OpenEP-MATLAB/registered_case.mat")
